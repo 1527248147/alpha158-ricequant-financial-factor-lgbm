@@ -1,0 +1,56 @@
+{
+  "window": {
+    "start": "2025-01-02",
+    "end": "2025-12-10",
+    "data_end": "2025-12-15",
+    "preheat": "2024-12-31",
+    "tail_start": "2025-12-11"
+  },
+  "strategy": {
+    "name": "TopkDropout (qlib-style)",
+    "topk": 50,
+    "n_drop": 5,
+    "shift": 1,
+    "deal_price": "close"
+  },
+  "rules": {
+    "settlement_t1": true,
+    "ipo_min_days": 60,
+    "max_blocked_days": 60,
+    "haircut": 0.05,
+    "limit_eps": 0.0015,
+    "limit_tiny": 0.001,
+    "lot_size": 100,
+    "costs_bps": {
+      "buy_cost_bps": 15.0,
+      "sell_cost_bps": 15.0,
+      "sell_stamp_bps": 10.0,
+      "min_cost": 0.0
+    }
+  },
+  "result": {
+    "nav_start": 1000000.0,
+    "nav_end_mtm_at_window_end": 1306698.5766049996,
+    "nav_end_at_data_end": 1294409.3283049995,
+    "nav_end_terminal": 1294409.3283049995,
+    "total_fee_paid": 90254.34169499991,
+    "forced_liquidations_total": 2,
+    "terminal_liquidations_total": 0,
+    "trades_total": 2132,
+    "buys": 1066,
+    "sells": 1064
+  },
+  "buy_skip_reason": {
+    "missing_row": 20,
+    "invalid_row": 0,
+    "limit_locked": 5,
+    "ipo_too_new": 14,
+    "lot_too_small": 2856,
+    "insufficient_cash": 0
+  },
+  "sell_block_reason": {
+    "missing_row": 126,
+    "invalid_row": 0,
+    "limit_locked": 0
+  }
+}
