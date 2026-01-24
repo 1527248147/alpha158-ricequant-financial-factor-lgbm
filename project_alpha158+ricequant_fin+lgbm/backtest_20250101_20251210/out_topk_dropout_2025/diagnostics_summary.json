@@ -30,27 +30,27 @@
   },
   "result": {
     "nav_start": 1000000.0,
-    "nav_end_mtm_at_window_end": 1306698.5766049996,
-    "nav_end_at_data_end": 1294409.3283049995,
-    "nav_end_terminal": 1294409.3283049995,
-    "total_fee_paid": 90254.34169499991,
+    "nav_end_mtm_at_window_end": 1294790.0350199998,
+    "nav_end_at_data_end": 1281161.75922,
+    "nav_end_terminal": 1281161.75922,
+    "total_fee_paid": 91322.2807799998,
     "forced_liquidations_total": 2,
     "terminal_liquidations_total": 0,
-    "trades_total": 2132,
-    "buys": 1066,
-    "sells": 1064
+    "trades_total": 2122,
+    "buys": 1061,
+    "sells": 1059
   },
   "buy_skip_reason": {
     "missing_row": 20,
     "invalid_row": 0,
-    "limit_locked": 5,
-    "ipo_too_new": 14,
-    "lot_too_small": 2856,
+    "limit_locked": 13,
+    "ipo_too_new": 20,
+    "lot_too_small": 4075,
     "insufficient_cash": 0
   },
   "sell_block_reason": {
-    "missing_row": 126,
+    "missing_row": 195,
     "invalid_row": 0,
-    "limit_locked": 0
+    "limit_locked": 14
   }
 }
