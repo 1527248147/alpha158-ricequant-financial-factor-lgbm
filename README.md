@@ -120,7 +120,7 @@ python train_models\train_lgbm_lambdarank_strict_calendar_v4_fundselect_validper
 ```
 train_models\_train_lambdarank_v4_alpha_plus_fundTop15_seed42
 ```
-summary.json中有关于icmean，ir的具体情况
+- summary.json中有关于icmean，ir的具体情况
 ---
 
 ### Step 3 — 复现回测（Backtest）
@@ -140,7 +140,7 @@ python backtest_20250101_20251210\backtest_topk_dropout.py ^
 ```
 backtest_20250101_20251210\out_topk_dropout_2025
 ```
-nav_net_vs_zero_cost.csv有资产变化情况。
+- nav_net_vs_zero_cost.csv有资产变化情况。
 ---
 
 ## Repo Structure
