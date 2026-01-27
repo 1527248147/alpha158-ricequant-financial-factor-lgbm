@@ -1,0 +1,22 @@
+{
+  "annual_return": 0.2820787805915933,
+  "cumulative_return": 0.28116175921999687,
+  "annual_volatility": 0.15879093099692387,
+  "max_drawdown": -0.10784993766289015,
+  "avg_drawdown": -0.013754523776270493,
+  "sharpe_ratio": 1.776416189644091,
+  "sortino_ratio": 1.7658666054961256,
+  "calmar_ratio": 2.615474674387811,
+  "omega_ratio": 1.4352803299339199,
+  "t_statistic": 1.704466400568973,
+  "skewness": -3.011976228316102,
+  "kurtosis": 28.348846878138605,
+  "n_observations": 232,
+  "hit_rate": 0.5732758620689655,
+  "profit_factor": 1.4352803299339199,
+  "annual_excess_return": 0.02902410298435213,
+  "tracking_error": 0.12056898812892057,
+  "information_ratio": 0.24072610573224337,
+  "alpha": 0.11368839202557324,
+  "beta": 0.667037564130824
+}

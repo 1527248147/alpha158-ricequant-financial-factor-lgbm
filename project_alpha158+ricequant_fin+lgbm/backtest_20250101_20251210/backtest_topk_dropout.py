@@ -8,7 +8,7 @@
 
 
 # cd /d C:\AI_STOCK\project_alpha158+ricequant_fin+lgbm
-#
+
 # python backtest_20250101_20251210\backtest_topk_dropout.py ^
 #   --model_dir "train_models\_train_lambdarank_v4_alpha_plus_fundTop15_seed42" ^
 #   --features_dir "labeled\_calendar\labeled_yearly_parquet" ^
@@ -16,24 +16,53 @@
 #   --calendar_csv "dataset\trading_calendar_from_merged.csv" ^
 #   --out_dir "backtest_20250101_20251210\out_topk_dropout_2025" ^
 #   --topk 50 --n_drop 5 --init_cash 1000000 --settlement_t1
+#   --enable_benchmark --benchmark_csv "backtest_20250101_20251210\benchmark_000985.csv" ^
+#   --compute_ic
 
-#2026/01/24更新，额外增加了对st的涨停判断
+
+
+
+
+
+# backtest_topk_dropout.py
+# Qlib-style TopkDropout backtest with conservative A-share constraints + Benchmark(000985) + IC/RankIC
+#
+# 核心语义：
+# - 每天收盘 EOD 用当天特征算分数 score(d)
+# - shift=1：score(d) 在下一个交易日 d+1 才允许执行买卖（这里执行价用 close，代表“收盘调仓”语义）
+# - TopkDropout：持仓目标 topk；每天尽量保持 topk；卖出 n_drop 个（优先卖出不在 topk 的、或分数最低的）
+#
+# 交易约束（保守）：
+# - 必须有 OHLCV 行且 open/high/low/close>0 且 volume>0 才视为“可交易”
+# - 涨跌停“锁死”判断：用 OHLCV + prev_close 推断（保守），主板同时检查 10% 和 5%(覆盖ST)，300/688=20%，8开头(BJ)=30%
+# - 买入日若锁死则跳过；卖出日若锁死则顺延（must_sell=True，blocked_sell_days++）
+# - 长期缺行/停牌/退市：blocked_sell_days 达到 max_blocked_days 强平（按最后可得价格再 haircut）
+# - data_end_date 终止日：对剩余持仓做 terminal liquidation（再 haircut）
+#
+# Benchmark：
+# - 使用本地 CSV（你已用 RiceQuant 拉好）：backtest_20250101_20251210\benchmark_000985.csv
+# - 需要至少包含：date + close（列名可不同，会自动猜）
+#
+# IC / RankIC：
+# - 对“信号日 t”的分数 score(t)，用严格交易日历的 t+1 与 t+2 close 计算 label：
+#   ret = close(t+2)/close(t+1) - 1
+# - 在 t+1 当天，我们已经拿到了 close(t+1)；再去取下一交易日 close(t+2) 即可计算当天的 IC/RIC
+# - 输出到 ic_daily.csv，并在 diagnostics_summary.json 里给出均值等统计
+
 import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-# LightGBM 用来加载 model.txt 并对每日截面做预测打分
 try:
     import lightgbm as lgb
 except Exception as e:
     raise RuntimeError("lightgbm is required. Please `pip install lightgbm`.") from e
 
-# PyArrow dataset 用来“按天过滤”读取 parquet（避免一次读全年，节省内存）
 try:
     import pyarrow as pa
     import pyarrow.dataset as ds
@@ -42,37 +71,26 @@ except Exception as e:
     raise RuntimeError("pyarrow is required. Please `pip install pyarrow`.") from e
 
 
-# ============================================================
-# 0) 工具函数（路径、日期、日历）
-# ============================================================
+# -----------------------------
+# Utils
+# -----------------------------
 def ensure_dir(p: Path) -> None:
-    """确保输出目录存在。"""
     p.mkdir(parents=True, exist_ok=True)
 
 
 def parse_date(s: str) -> pd.Timestamp:
-    """解析日期字符串 -> 归一化到 00:00:00（方便和日历对齐）。"""
     return pd.to_datetime(s).normalize()
 
 
 def fmt_date(d: pd.Timestamp) -> str:
-    """Timestamp -> 'YYYY-MM-DD' 字符串。用于 CSV 输出。"""
     return d.strftime("%Y-%m-%d")
 
 
 def year_of(d: pd.Timestamp) -> int:
-    """Timestamp -> 年份 int。用于按年加载 parquet。"""
     return int(d.strftime("%Y"))
 
 
 def read_calendar_dates(calendar_csv: str) -> List[pd.Timestamp]:
-    """
-    读取严格交易日历（必须是交易日序列），并返回排序后的 Timestamp 列表。
-    该日历用于：
-    - 定义回测循环的“交易日集合”
-    - 计算 IPO 上市后第 N 个交易日（ipo_min_days）
-    - 对 start/end/data_end 做对齐
-    """
     df = pd.read_csv(calendar_csv)
     col = "date" if "date" in df.columns else df.columns[0]
     s = pd.to_datetime(df[col], errors="coerce").dropna().dt.normalize()
@@ -83,10 +101,6 @@ def read_calendar_dates(calendar_csv: str) -> List[pd.Timestamp]:
 
 
 def prev_trading_day(cal: List[pd.Timestamp], d: pd.Timestamp) -> Optional[pd.Timestamp]:
-    """
-    给定交易日历 cal，找 d 的前一个交易日。
-    用 np.searchsorted 做二分定位，避免线性扫描。
-    """
     arr = np.array(cal, dtype="datetime64[ns]")
     idx = np.searchsorted(arr, np.datetime64(d), side="left") - 1
     if idx < 0:
@@ -95,9 +109,6 @@ def prev_trading_day(cal: List[pd.Timestamp], d: pd.Timestamp) -> Optional[pd.Ti
 
 
 def next_trading_day(cal: List[pd.Timestamp], d: pd.Timestamp) -> Optional[pd.Timestamp]:
-    """
-    给定交易日历 cal，找 d 的后一个交易日。
-    """
     arr = np.array(cal, dtype="datetime64[ns]")
     idx = np.searchsorted(arr, np.datetime64(d), side="right")
     if idx >= len(cal):
@@ -105,16 +116,7 @@ def next_trading_day(cal: List[pd.Timestamp], d: pd.Timestamp) -> Optional[pd.Ti
     return cal[idx]
 
 
-# ============================================================
-# 1) 模型输入列 / 年度 parquet 定位
-# ============================================================
 def load_used_features(model_dir: str) -> List[str]:
-    """
-    used_features.txt 是推理特征列“合同”，必须：
-    - 列名存在
-    - 顺序严格一致（LightGBM 对列顺序敏感）
-    - 严禁包含 label__（否则会未来泄露）
-    """
     p = Path(model_dir) / "used_features.txt"
     if not p.exists():
         raise FileNotFoundError(f"used_features.txt not found: {p}")
@@ -126,10 +128,6 @@ def load_used_features(model_dir: str) -> List[str]:
 
 
 def find_year_parquet(dir_path: str, year: int) -> Path:
-    """
-    在目录中定位某一年对应的 parquet 文件。
-    兼容多种命名：year=YYYY.parquet / YYYY.parquet / rq_ohlcv_YYYY.parquet ...
-    """
     d = Path(dir_path)
     patterns = [
         d / f"year={year}.parquet",
@@ -148,15 +146,10 @@ def find_year_parquet(dir_path: str, year: int) -> Path:
 
 
 def parquet_existing_columns(p: Path) -> List[str]:
-    """读取 parquet schema，列出列名（不用把数据读入内存）。"""
     return pq.ParquetFile(str(p)).schema_arrow.names
 
 
 def read_parquet_safe(p: Path, want_cols: List[str]) -> pd.DataFrame:
-    """
-    只读取存在的列（避免 columns 参数指定不存在列时报错）。
-    如果 want_cols 全都不存在，则退化为读全表（兜底）。
-    """
     exist = set(parquet_existing_columns(p))
     cols = [c for c in want_cols if c in exist]
     if not cols:
@@ -164,16 +157,53 @@ def read_parquet_safe(p: Path, want_cols: List[str]) -> pd.DataFrame:
     return pd.read_parquet(p, columns=cols)
 
 
-# ============================================================
-# 2) OHLCV 年度缓存（按天切片）
-# ============================================================
-class OHLCVYearCache:
-    """
-    目的：避免在回测循环里重复读同一年 OHLCV parquet。
+# -----------------------------
+# Benchmark loader (local CSV)
+# -----------------------------
+def _pick_col(cols: List[str], candidates: List[str]) -> Optional[str]:
+    lower = {c.lower(): c for c in cols}
+    for cand in candidates:
+        if cand.lower() in lower:
+            return lower[cand.lower()]
+    return None
 
-    - 首次访问某年 -> 读入该年 parquet，统一字段名并 set_index(date,symbol)
-    - 每个交易日 d -> 用 xs(d) 取当日行情表（index 仍保留 date,symbol 便于 loc）
+
+def load_benchmark_csv(path: str) -> pd.DataFrame:
     """
+    读取本地 benchmark CSV（000985 中证全指）
+    需要至少有：date + close
+    列名可能不同：会自动猜
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"benchmark_csv not found: {p}")
+
+    df = pd.read_csv(p)
+    if df.empty:
+        raise ValueError(f"benchmark_csv is empty: {p}")
+
+    date_col = _pick_col(df.columns.tolist(), ["date", "datetime", "trade_date", "time"])
+    close_col = _pick_col(df.columns.tolist(), ["close", "Close", "收盘", "收盘价", "price", "index_close"])
+
+    if date_col is None or close_col is None:
+        raise ValueError(
+            f"benchmark_csv must contain date+close. "
+            f"Detected date_col={date_col}, close_col={close_col}, columns={df.columns.tolist()}"
+        )
+
+    out = df[[date_col, close_col]].copy()
+    out = out.rename(columns={date_col: "date", close_col: "close"})
+    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.normalize()
+    out["close"] = pd.to_numeric(out["close"], errors="coerce")
+    out = out.dropna(subset=["date", "close"])
+    out = out.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+    return out
+
+
+# -----------------------------
+# OHLCV cache
+# -----------------------------
+class OHLCVYearCache:
     def __init__(self, ohlcv_dir: str):
         self.ohlcv_dir = ohlcv_dir
         self._cache: Dict[int, pd.DataFrame] = {}
@@ -182,13 +212,13 @@ class OHLCVYearCache:
         p = find_year_parquet(self.ohlcv_dir, year)
         df = pd.read_parquet(p)
 
-        # 兼容列名差异
+        # 统一字段名
         if "symbol" not in df.columns and "order_book_id" in df.columns:
             df = df.rename(columns={"order_book_id": "symbol"})
         if "date" not in df.columns and "datetime" in df.columns:
             df = df.rename(columns={"datetime": "date"})
 
-        # 兼容不同 volume 字段名
+        # 找 volume 列
         vol_col = None
         for c in ["volume", "total_volume", "vol", "volume_traded"]:
             if c in df.columns:
@@ -198,29 +228,25 @@ class OHLCVYearCache:
             df["volume"] = np.nan
             vol_col = "volume"
 
-        # 强制要求 OHLC 列存在
         miss = [c for c in ["date", "symbol", "open", "high", "low", "close"] if c not in df.columns]
         if miss:
             raise ValueError(f"OHLCV missing columns {miss} in {p}")
 
-        # 统一字段顺序
         df = df[["date", "symbol", "open", "high", "low", "close", vol_col]].copy()
         if vol_col != "volume":
             df = df.rename(columns={vol_col: "volume"})
 
-        # 标准化类型
         df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
         df = df.dropna(subset=["date", "symbol"])
         df["symbol"] = df["symbol"].astype(str)
+
         for c in ["open", "high", "low", "close", "volume"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-        # 建立 (date, symbol) 多级索引便于当日查询
         df = df.set_index(["date", "symbol"]).sort_index()
         self._cache[year] = df
 
     def get_day(self, d: pd.Timestamp) -> pd.DataFrame:
-        """返回某交易日 d 的所有股票行情行。若该日无数据返回空 DataFrame。"""
         y = year_of(d)
         if y not in self._cache:
             self._load_year(y)
@@ -231,18 +257,10 @@ class OHLCVYearCache:
             return pd.DataFrame(columns=dfy.columns).set_index(["date", "symbol"])
 
 
-# ============================================================
-# 3) 特征按天读取（PyArrow dataset filter）
-# ============================================================
+# -----------------------------
+# Features day loader
+# -----------------------------
 class FeaturesDayLoader:
-    """
-    目的：按天加载特征 parquet，避免一年特征全部读入。
-
-    features parquet 预期字段：
-    - datetime (可能是 timestamp/date，也可能是 string)
-    - order_book_id
-    - used_features.txt 中列（Alpha158 + fund__...）
-    """
     def __init__(self, features_dir: str, used_features: List[str]):
         self.features_dir = features_dir
         self.used_features = used_features
@@ -252,7 +270,6 @@ class FeaturesDayLoader:
     def _get_dataset(self, year: int) -> ds.Dataset:
         if year in self._ds_cache:
             return self._ds_cache[year]
-
         p = find_year_parquet(self.features_dir, year)
         dset = ds.dataset(str(p), format="parquet")
         self._ds_cache[year] = dset
@@ -262,7 +279,6 @@ class FeaturesDayLoader:
             raise ValueError(f"Features parquet missing 'datetime' column: {p}")
 
         dt_type = schema.field("datetime").type
-        # datetime 既可能是 timestamp/date，也可能是 string
         if pa.types.is_timestamp(dt_type) or pa.types.is_date(dt_type):
             self._dt_field_type[year] = "timestamp"
         else:
@@ -270,23 +286,14 @@ class FeaturesDayLoader:
         return dset
 
     def load_day(self, d: pd.Timestamp) -> pd.DataFrame:
-        """
-        读取当天 d 的特征全截面（所有股票），返回 DataFrame：
-        - datetime（归一化）
-        - order_book_id（字符串）
-        - used_features 列
-        """
         y = year_of(d)
         dset = self._get_dataset(y)
 
         cols = ["datetime", "order_book_id"] + self.used_features
-
-        # 特征列必须齐全，否则直接报错（防止默默缺列导致模型输入错位）
         missing = [c for c in (["order_book_id"] + self.used_features) if c not in dset.schema.names]
         if missing:
             raise ValueError(f"Features parquet year {y} missing columns: {missing[:10]} ...")
 
-        # PyArrow filter：只取 datetime == d 的行
         if self._dt_field_type[y] == "timestamp":
             filt = (ds.field("datetime") == np.datetime64(d))
         else:
@@ -300,21 +307,17 @@ class FeaturesDayLoader:
         return df
 
 
-# ============================================================
-# 4) IPO 首次可交易日（构建 IPO 过滤）
-# ============================================================
+# -----------------------------
+# IPO first-tradeable-day builder
+# -----------------------------
 def build_first_tradeable_day(
     ohlcv_dir: str,
     symbols_needed: List[str],
     cache_path: Path,
 ) -> Dict[str, pd.Timestamp]:
     """
-    目的：给每只股票计算一个“首次可交易日”（在 OHLCV 中首次出现且 close>0 & volume>0）。
-    然后在回测里做 IPO 过滤：上市后 ipo_min_days 个交易日内不买。
-
-    为了避免每次回测都扫全历史 parquet：
-    - 如果 cache_path 存在：直接读缓存
-    - 否则：按年 parquet 扫描并写入 cache
+    用 OHLCV 扫描每只股票第一次出现“close>0 & volume>0”的交易日，作为 first_tradeable_day
+    用于过滤新股（ipo_min_days）
     """
     if cache_path.exists():
         df = pd.read_csv(cache_path)
@@ -329,7 +332,6 @@ def build_first_tradeable_day(
     if not files:
         raise FileNotFoundError(f"No parquet files in ohlcv_dir: {ohlcv_dir}")
 
-    # 尝试按文件名提取年份排序（尽量从早到晚）
     def extract_year(p: Path) -> int:
         digits = "".join([c if c.isdigit() else " " for c in p.stem]).split()
         yrs = [int(x) for x in digits if len(x) == 4 and 1990 <= int(x) <= 2100]
@@ -341,8 +343,7 @@ def build_first_tradeable_day(
         if not needed:
             break
 
-        # 只读必要列，提高扫描速度
-        df = read_parquet_safe(p, ["date", "symbol", "close", "volume", "total_volume"])
+        df = read_parquet_safe(p, ["date", "symbol", "order_book_id", "close", "volume", "total_volume"])
 
         if "symbol" not in df.columns and "order_book_id" in df.columns:
             df = df.rename(columns={"order_book_id": "symbol"})
@@ -360,14 +361,12 @@ def build_first_tradeable_day(
         df["close"] = pd.to_numeric(df["close"], errors="coerce")
         df[vol_col] = pd.to_numeric(df[vol_col], errors="coerce")
 
-        # 只保留我们需要的 symbol（减少 groupby 成本）
         df = df[df["symbol"].isin(needed)]
         df = df.dropna(subset=["date", "symbol", "close", vol_col])
         df = df[(df["close"] > 0) & (df[vol_col] > 0)]
         if df.empty:
             continue
 
-        # 每只股票第一次出现的日期
         g = df.groupby("symbol")["date"].min()
         for sym, dt in g.items():
             if sym not in first:
@@ -379,15 +378,12 @@ def build_first_tradeable_day(
     return first
 
 
-# ============================================================
-# 5) 交易规则：可交易性、涨跌停锁死、费用
-# ============================================================
+# -----------------------------
+# Trading rules
+# -----------------------------
 def is_valid_price_row(row: pd.Series) -> bool:
     """
-    最保守的“可交易行”判断：
-    - OHLC 必须都是正数且 finite
-    - volume 必须 >0
-    缺行/停牌/成交为 0 -> 视为不可交易
+    保守：没有 open/high/low/close 或者 <=0，或者 volume<=0，都视为不可交易
     """
     for c in ["open", "high", "low", "close"]:
         v = row.get(c, np.nan)
@@ -401,14 +397,12 @@ def is_valid_price_row(row: pd.Series) -> bool:
 
 def infer_limit_rates(sym: str) -> List[float]:
     """
-    根据股票代码前缀推断涨跌停比例（用 OHLCV/代码即可，不依赖外部 ST 标签）：
+    推断涨跌停比例（保守）
 
     - 688xxx 科创板：20%
     - 300xxx 创业板：20%
-    - 8xx... 北交所：30%（可选；保守起见如果你的数据里有）
-    - 其他（主板）：同时检查 10% 和 5%
-      解释：主板普通是 10%，ST 是 5%。
-      我们用“双档”覆盖，不需要知道是不是 ST，但会略偏保守（可能误判少量非 ST）
+    - 8xxxx  北交所：30%（若你不想考虑北交所，可删掉）
+    - 其它主板：同时检查 10% 和 5%（覆盖 ST 5% 但不需要 ST 标签）
     """
     code = sym.split(".")[0] if "." in sym else sym
     if code.startswith("688"):
@@ -417,25 +411,24 @@ def infer_limit_rates(sym: str) -> List[float]:
         return [0.20]
     if code.startswith("8"):
         return [0.30]
+    # 主板：10% + 5%(ST)
     return [0.10, 0.05]
 
 
 def is_limit_locked(row: pd.Series, prev_close: float, eps: float, tiny: float, sym: str) -> bool:
     """
-    用 OHLCV 做“涨跌停封死（无法成交）”的保守判定。
+    用 OHLCV + prev_close 做“涨跌停锁死”判定（保守）
 
-    判定逻辑（保守）：
-    1) intraday range 很小：(high-low)/prev_close <= tiny
-       -> 近似“一字板/几乎没有成交区间”
-    2) close 接近涨停价或跌停价：
-       close ~= prev_close*(1±L)
+    LOCKED 条件：
+      - 当天几乎没有价格波动：(high-low)/prev_close <= tiny
+      - 且 close 接近 涨停价 或 跌停价（按推断的 limit_rate）
 
-    注意：
-    - prev_close 必须是“昨天收盘价”，不能用今天收盘价（否则会未来信息/逻辑错误）
-    - L 由 infer_limit_rates(sym) 得到（主板 10%+5%，科创/创业 20%）
+    说明：
+    - 没有 ST 标记时，主板同时检查 10% 和 5%，可覆盖 ST 5% 情况（更保守，可能略多跳过）
+    - 300/688 检查 20%，8 开头检查 30%
     """
     if not np.isfinite(prev_close) or prev_close <= 0:
-        return True  # 没有可靠昨日收盘价 -> 直接保守认为不可成交
+        return True  # 更保守：不知道昨收，直接当锁死/不可交易
 
     high = float(row["high"])
     low = float(row["low"])
@@ -443,11 +436,11 @@ def is_limit_locked(row: pd.Series, prev_close: float, eps: float, tiny: float, 
     if not (np.isfinite(high) and np.isfinite(low) and np.isfinite(close)):
         return True
 
-    # 如果当日振幅足够大，说明不是“封死”，允许交易
+    # 如果日内有明显波动，就不算“锁死”
     if (high - low) / prev_close > tiny:
         return False
 
-    # 按不同涨跌停档位检查（含主板 10%+5%）
+    # 贴近涨停/跌停价
     for L in infer_limit_rates(sym):
         up = prev_close * (1.0 + L)
         dn = prev_close * (1.0 - L)
@@ -460,67 +453,109 @@ def is_limit_locked(row: pd.Series, prev_close: float, eps: float, tiny: float, 
 
 def calc_fee(value: float, bps: float, min_cost: float) -> float:
     """
-    费用模型（简化）：
-    - fee = value * bps/10000
-    - 再取 max(fee, min_cost)
+    bps: 万分之 bps
     """
     fee = value * (bps / 10000.0)
     return max(fee, min_cost) if value > 0 else 0.0
 
 
-# ============================================================
-# 6) 持仓结构
-# ============================================================
 @dataclass
 class Position:
-    """
-    一笔持仓记录：
-    - shares：股数（按 A 股 100 股一手）
-    - must_sell：是否“强制需要卖出”（例如进入 tail、或之前卖不掉）
-    - blocked_sell_days：连续卖不掉的天数（用于触发强平）
-    - last_mark_price：用于 MTM（Mark-to-Market）估值
-    """
     symbol: str
     shares: int
     buy_date: str
     buy_price: float
-    must_sell: bool = False
-    blocked_sell_days: int = 0
-    last_mark_price: float = 0.0
+    must_sell: bool = False              # 是否“必须卖”（例如不在 topk 或 tail 强制清仓）
+    blocked_sell_days: int = 0           # 卖不掉累计天数（涨跌停/停牌/缺行/无量）
+    last_mark_price: float = 0.0         # 最近一次能拿到的 close 用于 MTM 和强平价格兜底
 
 
-# ============================================================
-# 7) 回测主流程（TopkDropout 模板）
-# ============================================================
+# -----------------------------
+# Performance metrics
+# -----------------------------
+def _max_drawdown_from_nav(nav: pd.Series) -> float:
+    nav = nav.dropna()
+    if nav.empty:
+        return np.nan
+    peak = nav.cummax()
+    dd = (nav / peak) - 1.0
+    return float(dd.min())
+
+
+def compute_basic_metrics(returns: pd.Series, benchmark_returns: Optional[pd.Series] = None) -> Dict:
+    """
+    不依赖 scipy 的基础绩效指标（够用且稳）
+    - annual_return, annual_vol, sharpe, max_drawdown, hit_rate
+    - 若有基准：excess_return, info_ratio, beta, alpha(简化)
+    """
+    r = returns.dropna()
+    out: Dict = {}
+    out["n_obs"] = int(len(r))
+    if len(r) < 30:
+        out["error"] = "数据不足（需要30个以上观测值）"
+        return out
+
+    ann_ret = float(r.mean() * 252.0)
+    ann_vol = float(r.std(ddof=1) * np.sqrt(252.0))
+    sharpe = float(ann_ret / ann_vol) if ann_vol > 0 else 0.0
+
+    nav = (1 + r).cumprod()
+    mdd = _max_drawdown_from_nav(nav)
+
+    out.update({
+        "annual_return": ann_ret,
+        "annual_volatility": ann_vol,
+        "sharpe_ratio": sharpe,
+        "cumulative_return": float(nav.iloc[-1] - 1.0),
+        "max_drawdown": float(mdd),
+        "hit_rate": float((r > 0).mean()),
+        "mean_daily_return": float(r.mean()),
+        "std_daily_return": float(r.std(ddof=1)),
+    })
+
+    if benchmark_returns is not None:
+        bm = benchmark_returns.reindex(r.index).dropna()
+        rr = r.reindex(bm.index).dropna()
+        bm = bm.reindex(rr.index).dropna()
+        if len(rr) >= 30 and len(bm) >= 30:
+            excess = rr - bm
+            te = float(excess.std(ddof=1) * np.sqrt(252.0))
+            ir = float(excess.mean() * 252.0 / te) if te > 0 else 0.0
+
+            cov = float(np.cov(rr.values, bm.values, ddof=1)[0, 1])
+            var_bm = float(np.var(bm.values, ddof=1))
+            beta = cov / var_bm if var_bm > 0 else np.nan
+            alpha = float((rr.mean() - beta * bm.mean()) * 252.0) if np.isfinite(beta) else np.nan
+
+            out.update({
+                "annual_excess_return": float(excess.mean() * 252.0),
+                "tracking_error": te,
+                "information_ratio": ir,
+                "beta": float(beta) if np.isfinite(beta) else np.nan,
+                "alpha": alpha,
+            })
+    return out
+
+
+# -----------------------------
+# Backtest core
+# -----------------------------
 def run_backtest(args: argparse.Namespace) -> None:
-    """
-    交易语义（关键）：
-    - shift=1：T 日收盘后算 score，T+1 才执行（用当日 close 作为成交价的简化）
-    - TopkDropout：每天目标持仓 topk；卖出 n_drop；再从当日 topk 里补足
-
-    本版本还包括：
-    - 严格可交易性：缺行/停牌/volume=0 -> 不买不卖（卖不掉会延期）
-    - 涨跌停封死：用 OHLCV + prev_close 做保守判定
-    - IPO 过滤：上市后 ipo_min_days 个交易日内不买
-    - 结算规则：可选 settlement_t1（卖出现金次日可用）
-    - 长期卖不掉强平：blocked_sell_days >= max_blocked_days -> 强平（并 haircut 额外打击）
-    - 数据到期 terminal liquidation：data_end 当天全部强平
-    """
     out_dir = Path(args.out_dir)
     ensure_dir(out_dir)
 
-    # ---------- 读交易日历 ----------
+    # 交易日历
     cal = read_calendar_dates(args.calendar_csv)
     cal_set = set(cal)
-    cal_idx = {d: i for i, d in enumerate(cal)}  # 交易日 -> 序号（用于上市天数计算）
+    cal_idx = {d: i for i, d in enumerate(cal)}
 
-    # ---------- 对齐时间窗口 ----------
+    # 时间窗口
     start = parse_date(args.start_date)
     end = parse_date(args.end_date)
     data_end = parse_date(args.data_end_date)
     tail_start = parse_date(args.tail_start_date)
 
-    # 确保 start/end/data_end 都是交易日
+    # 对齐到交易日
     if start not in cal_set:
         start = next_trading_day(cal, start) or start
     if end not in cal_set:
@@ -533,12 +568,12 @@ def run_backtest(args: argparse.Namespace) -> None:
     if end > data_end:
         raise ValueError(f"end_date {end} is after data_end_date {data_end}")
 
-    # preheat：为了在第一个交易日 start 做涨跌停判断，需要 start 的“昨日收盘价”
+    # preheat：为了在 start 当天能拿到 prev_close（昨收），至少要多读一天
     preheat = prev_trading_day(cal, start)
     if preheat is None:
         raise ValueError("Cannot find preheat trading day before start.")
 
-    # ---------- 加载模型与特征 ----------
+    # 载入模型和特征列
     used_features = load_used_features(args.model_dir)
     model_path = Path(args.model_dir) / "model.txt"
     if not model_path.exists():
@@ -548,7 +583,7 @@ def run_backtest(args: argparse.Namespace) -> None:
     feat_loader = FeaturesDayLoader(args.features_dir, used_features)
     ohlcv_cache = OHLCVYearCache(args.ohlcv_dir)
 
-    # ---------- 生成回测 universe（窗口内出现过的股票） ----------
+    # Universe：从 [preheat, end] 的 features 里出现过的股票集合（避免扫全市场过慢）
     universe_syms: List[str] = []
     for d in cal:
         if d < preheat:
@@ -561,39 +596,44 @@ def run_backtest(args: argparse.Namespace) -> None:
     if not universe_syms:
         raise RuntimeError("No symbols found in features for the selected window.")
 
-    # ---------- IPO 首日缓存（用于 IPO 过滤） ----------
+    # IPO 首个可交易日缓存
     ipo_cache_path = out_dir / "first_tradeable_day_cache.csv"
     first_day_map = build_first_tradeable_day(args.ohlcv_dir, universe_syms, ipo_cache_path)
 
-    # ---------- 资金与持仓状态 ----------
+    # 账户状态
     cash_available = float(args.init_cash)  # 可用现金
-    cash_settling = 0.0                    # 若 settlement_t1，则卖出资金暂存这里，次日到账
-    positions: Dict[str, Position] = {}    # symbol -> Position
+    cash_settling = 0.0                     # 卖出待结算（T+1 可用）
+    positions: Dict[str, Position] = {}     # 当前持仓
 
-    # last_close 记录“昨日收盘价”，用于当日涨跌停判定
-    # 关键点：必须在“日终”更新（否则会用到未来信息）
+    # last_close：记录“昨天 close”，用于推断涨跌停价
+    # 注意：我们在每天循环开始时 snapshot 到 prev_close_map，再做交易；每天结束后才更新 last_close
     last_close: Dict[str, float] = {}
 
-    # scores_pending 代表：上一交易日 EOD 生成的 score（要在下一交易日执行）
+    # scores_pending：上一交易日 EOD 生成的 score（shift=1），用于本日执行
     scores_pending: Optional[pd.Series] = None
-    pending_signal_day: Optional[pd.Timestamp] = None
+    pending_signal_day: Optional[pd.Timestamp] = None  # scores_pending 对应的信号日（t）
 
-    # ---------- 输出记录 ----------
+    # 输出表
     nav_rows = []
     diag_rows = []
     trade_rows = []
+    ic_rows = []
 
-    # 统计：买入跳过原因、卖出阻塞原因
-    buy_skip_totals = {"missing_row": 0, "invalid_row": 0, "limit_locked": 0, "ipo_too_new": 0, "lot_too_small": 0, "insufficient_cash": 0}
+    # 诊断统计
+    buy_skip_totals = {
+        "missing_row": 0,
+        "invalid_row": 0,
+        "limit_locked": 0,
+        "ipo_too_new": 0,
+        "lot_too_small": 0,
+        "insufficient_cash": 0,
+    }
     sell_block_totals = {"missing_row": 0, "invalid_row": 0, "limit_locked": 0}
-
     forced_liq_total = 0
     terminal_liq_total = 0
     cum_fee = 0.0
 
-    # ============================================================
-    # 回测循环：按严格交易日历逐日推进
-    # ============================================================
+    # 主循环：从 preheat 到 data_end
     for d in cal:
         if d < preheat:
             continue
@@ -602,52 +642,93 @@ def run_backtest(args: argparse.Namespace) -> None:
 
         d_str = fmt_date(d)
 
-        # ------------------------------------------------------------
-        # 1) 关键：在交易前 snapshot 昨日收盘价（避免今日更新导致 prev_close 错用）
-        # ------------------------------------------------------------
+        # 交易开始前，snapshot 昨收（防止当天更新 close 影响涨跌停推断）
         prev_close_map = last_close.copy()
 
-        # ------------------------------------------------------------
-        # 2) 结算：若 T+1 结算，则把“昨天卖出的资金”在今天开盘前到账
-        # ------------------------------------------------------------
+        # T+1 结算：把昨天卖出的钱转入可用现金
         if args.settlement_t1 and cash_settling != 0.0:
             cash_available += cash_settling
             cash_settling = 0.0
 
-        # ------------------------------------------------------------
-        # 3) 取当日 OHLCV 截面（用于买卖成交价、可交易性、涨跌停判定）
-        # ------------------------------------------------------------
+        # 读取当天 OHLCV（用于交易和 MTM）
         day_ohlcv = ohlcv_cache.get_day(d)
         day_index = day_ohlcv.index
 
-        def get_ohlcv(sym: str) -> Optional[pd.Series]:
-            """取当日某只股票的 OHLCV 行；不存在返回 None。"""
-            key = (d, sym)
-            if key in day_index:
-                return day_ohlcv.loc[key]
+        def get_ohlcv(day_df: pd.DataFrame, day_idx, day: pd.Timestamp, sym: str) -> Optional[pd.Series]:
+            key = (day, sym)
+            if key in day_idx:
+                return day_df.loc[key]
             return None
 
-        # ------------------------------------------------------------
-        # 4) MTM：用今日 close 更新持仓的 last_mark_price
-        #    注意：这只是估值，不等于能卖出成交
-        # ------------------------------------------------------------
+        # 先对已有持仓做 MTM（用当日 close）
         for sym, pos in positions.items():
-            row = get_ohlcv(sym)
+            row = get_ohlcv(day_ohlcv, day_index, d, sym)
             if row is not None:
                 c = row.get("close", np.nan)
                 if np.isfinite(c) and c > 0:
                     pos.last_mark_price = float(c)
 
-        # ------------------------------------------------------------
-        # 5) 定义窗口：main = 正常买卖；tail = 只卖不买
-        # ------------------------------------------------------------
+        # 窗口定义
         in_main = (start <= d <= end)
         in_tail = (d > end) and (tail_start <= d <= data_end)
 
-        # exec_scores：今天执行用的是“昨天 EOD 生成的 score”
+        # 今天可执行的分数（来自上一日 EOD）
         exec_scores = scores_pending if (scores_pending is not None and pending_signal_day is not None) else None
+        sig_day = pending_signal_day  # exec_scores 对应的信号日 t（执行日是 t+1）
 
-        # 当日统计
+        # ---------------- IC / RankIC（可选） ----------------
+        # 在执行日 d（=t+1）时，去取下一交易日 d2（=t+2）close，计算 label=close(d2)/close(d)-1
+        # 再与 score(t) 相关，得到 IC / RankIC（Spearman）
+        if args.compute_ic and exec_scores is not None and sig_day is not None:
+            d2 = next_trading_day(cal, d)
+            if d2 is not None and d2 <= data_end:
+                day2_ohlcv = ohlcv_cache.get_day(d2)
+                day2_idx = day2_ohlcv.index
+
+                # 构建 label
+                labels = {}
+                for sym, sc in exec_scores.items():
+                    # 只在“严格可得”时算：d 与 d2 都要有 valid row
+                    row1 = get_ohlcv(day_ohlcv, day_index, d, sym)
+                    row2 = get_ohlcv(day2_ohlcv, day2_idx, d2, sym)
+                    if row1 is None or row2 is None:
+                        continue
+                    if (not is_valid_price_row(row1)) or (not is_valid_price_row(row2)):
+                        continue
+                    c1 = float(row1["close"])
+                    c2 = float(row2["close"])
+                    if not (np.isfinite(c1) and np.isfinite(c2) and c1 > 0 and c2 > 0):
+                        continue
+                    labels[sym] = (c2 / c1) - 1.0
+
+                if len(labels) >= 20:
+                    s_label = pd.Series(labels, dtype=float)
+                    s_score = exec_scores.reindex(s_label.index).astype(float)
+
+                    # Pearson IC
+                    ic = float(s_score.corr(s_label, method="pearson"))
+                    # Spearman RankIC
+                    ric = float(s_score.corr(s_label, method="spearman"))
+
+                    ic_rows.append({
+                        "date": fmt_date(sig_day),         # 信号日 t
+                        "exec_date": fmt_date(d),          # 执行日 t+1
+                        "label_date": fmt_date(d2),        # t+2
+                        "n": int(len(s_label)),
+                        "ic": ic,
+                        "rank_ic": ric,
+                    })
+                else:
+                    ic_rows.append({
+                        "date": fmt_date(sig_day),
+                        "exec_date": fmt_date(d),
+                        "label_date": fmt_date(d2),
+                        "n": int(len(labels)),
+                        "ic": np.nan,
+                        "rank_ic": np.nan,
+                    })
+
+        # ---------------- 日内统计变量 ----------------
         buy_filled = 0
         sell_filled = 0
         sell_blocked = 0
@@ -661,37 +742,32 @@ def run_backtest(args: argparse.Namespace) -> None:
         traded_value_sell = 0.0
         fee_today = 0.0
 
-        # ============================================================
-        # A) 先卖（TopkDropout：先卖出要丢弃的，再补买）
-        # ============================================================
+        # ---------------- SELL ----------------
         sell_list: List[str] = []
 
+        # tail：只卖不买，强制清仓
         if in_tail:
-            # tail 窗口：把所有持仓都标记 must_sell，尽量清仓
             sell_list = list(positions.keys())
             for sym in sell_list:
                 positions[sym].must_sell = True
 
+        # main：TopkDropout 决定要卖哪些
         elif in_main and exec_scores is not None:
-            # main 窗口：按 exec_scores 做 TopkDropout 卖出决策
             held = list(positions.keys())
             if held:
-                # 对持仓股票取今日 score（没有就给极小）
                 held_scores = {sym: float(exec_scores.get(sym, -1e18)) for sym in held}
                 held_sorted_low = sorted(held, key=lambda s: held_scores[s])
 
-                # TopK 名单
                 topk_syms = set(exec_scores.sort_values(ascending=False).head(args.topk).index.tolist())
                 not_in_topk = [s for s in held_sorted_low if s not in topk_syms]
 
-                # 优先卖出“不在 topk”的低分持仓；不足 n_drop 再从 topk 内卖最低分补足
                 planned = []
                 planned.extend(not_in_topk[: args.n_drop])
                 if len(planned) < args.n_drop:
                     remain = [s for s in held_sorted_low if s in topk_syms and s not in planned]
                     planned.extend(remain[: (args.n_drop - len(planned))])
 
-                # must_sell（之前卖不掉/被标记的）必须优先纳入卖出列表
+                # must_sell 的优先
                 must = [s for s in held if positions[s].must_sell]
                 seen = set()
                 for s in must + planned:
@@ -699,15 +775,14 @@ def run_backtest(args: argparse.Namespace) -> None:
                         sell_list.append(s)
                         seen.add(s)
 
-        # ---------- 执行卖出 ----------
         for sym in sell_list:
             if sym not in positions:
                 continue
             pos = positions[sym]
 
-            row = get_ohlcv(sym)
+            row = get_ohlcv(day_ohlcv, day_index, d, sym)
 
-            # 1) 缺行：视为不可交易 -> 卖出阻塞；超过 max_blocked_days 则强平
+            # 1) 缺行：卖不掉，blocked+1；到 max_blocked_days 强平
             if row is None:
                 pos.must_sell = True
                 pos.blocked_sell_days += 1
@@ -716,13 +791,11 @@ def run_backtest(args: argparse.Namespace) -> None:
                 sell_block_totals["missing_row"] += 1
 
                 if pos.blocked_sell_days >= args.max_blocked_days:
-                    # 强平价格：用最后估值价（或买入价）再打 haircut
                     px = (pos.last_mark_price if pos.last_mark_price > 0 else pos.buy_price) * (1.0 - args.haircut)
                     value = px * pos.shares
                     fee = calc_fee(value, args.sell_cost_bps + args.sell_stamp_bps, args.min_cost)
                     proceeds = max(0.0, value - fee)
 
-                    # 结算规则：T+1 或立即到账
                     if args.settlement_t1:
                         cash_settling += proceeds
                     else:
@@ -744,12 +817,12 @@ def run_backtest(args: argparse.Namespace) -> None:
                         "shares": pos.shares,
                         "reason": "forced_liquidation_missing_row",
                         "sell_delay_days": pos.blocked_sell_days,
-                        "fee": fee
+                        "fee": fee,
                     })
                     del positions[sym]
                 continue
 
-            # 2) 行无效（停牌/volume=0/价格异常）：同样阻塞并计天数，触发强平
+            # 2) 行不合法：卖不掉，blocked+1；到 max_blocked_days 强平
             if not is_valid_price_row(row):
                 pos.must_sell = True
                 pos.blocked_sell_days += 1
@@ -784,12 +857,12 @@ def run_backtest(args: argparse.Namespace) -> None:
                         "shares": pos.shares,
                         "reason": "forced_liquidation_invalid_row",
                         "sell_delay_days": pos.blocked_sell_days,
-                        "fee": fee
+                        "fee": fee,
                     })
                     del positions[sym]
                 continue
 
-            # 3) 涨跌停封死（用“昨日收盘价” prev_close_map 判定）
+            # 3) 涨跌停锁死：卖不掉，blocked+1；到 max_blocked_days 强平（保守）
             prevc = prev_close_map.get(sym, np.nan)
             if is_limit_locked(row, prevc, args.limit_eps, args.limit_tiny, sym):
                 pos.must_sell = True
@@ -799,7 +872,6 @@ def run_backtest(args: argparse.Namespace) -> None:
                 sell_block_totals["limit_locked"] += 1
 
                 if pos.blocked_sell_days >= args.max_blocked_days:
-                    # 若封死仍强平：用当天 close 再打 haircut（保守）
                     px = float(row["close"]) * (1.0 - args.haircut)
                     value = px * pos.shares
                     fee = calc_fee(value, args.sell_cost_bps + args.sell_stamp_bps, args.min_cost)
@@ -826,12 +898,12 @@ def run_backtest(args: argparse.Namespace) -> None:
                         "shares": pos.shares,
                         "reason": "forced_liquidation_limit_locked",
                         "sell_delay_days": pos.blocked_sell_days,
-                        "fee": fee
+                        "fee": fee,
                     })
                     del positions[sym]
                 continue
 
-            # 4) 正常卖出：用当日 close 成交（简化）
+            # 4) 正常卖出（close 成交）
             px = float(row["close"])
             value = px * pos.shares
             fee = calc_fee(value, args.sell_cost_bps + args.sell_stamp_bps, args.min_cost)
@@ -857,17 +929,14 @@ def run_backtest(args: argparse.Namespace) -> None:
                 "shares": pos.shares,
                 "reason": "sold",
                 "sell_delay_days": pos.blocked_sell_days,
-                "fee": fee
+                "fee": fee,
             })
             del positions[sym]
 
-        # ============================================================
-        # B) 再买（从 TopK 补足持仓到 topk）
-        # ============================================================
+        # ---------------- BUY（tail 不买） ----------------
         if in_main and (not in_tail) and exec_scores is not None:
             scores_sorted = exec_scores.sort_values(ascending=False)
 
-            # 目标持仓 topk，已有持仓 len(positions)，剩余 slots 需要补买
             slots = max(0, args.topk - len(positions))
             if slots > 0:
                 for sym, _sc in scores_sorted.items():
@@ -876,7 +945,7 @@ def run_backtest(args: argparse.Namespace) -> None:
                     if sym in positions:
                         continue
 
-                    row = get_ohlcv(sym)
+                    row = get_ohlcv(day_ohlcv, day_index, d, sym)
                     if row is None:
                         buy_skip["missing_row"] += 1
                         buy_skip_totals["missing_row"] += 1
@@ -886,14 +955,13 @@ def run_backtest(args: argparse.Namespace) -> None:
                         buy_skip_totals["invalid_row"] += 1
                         continue
 
-                    # 涨跌停封死：买入侧也禁止（保守）
                     prevc = prev_close_map.get(sym, np.nan)
                     if is_limit_locked(row, prevc, args.limit_eps, args.limit_tiny, sym):
                         buy_skip["limit_locked"] += 1
                         buy_skip_totals["limit_locked"] += 1
                         continue
 
-                    # IPO 过滤：上市后 ipo_min_days 内不买
+                    # 新股过滤：距离 first_tradeable_day 需 >= ipo_min_days
                     fd = first_day_map.get(sym, None)
                     if fd is None or fd not in cal_idx:
                         buy_skip["ipo_too_new"] += 1
@@ -911,10 +979,8 @@ def run_backtest(args: argparse.Namespace) -> None:
                         buy_skip_totals["insufficient_cash"] += 1
                         break
 
-                    # 资金分配：简单等权（把当前可用现金按剩余 slots 平均分）
+                    # 简单等权：剩余现金 / 剩余槽位
                     budget = cash_available / float(slots)
-
-                    # A 股一手 100 股：向下取整到 lot_size
                     shares = int(budget / px / args.lot_size) * args.lot_size
                     if shares <= 0:
                         buy_skip["lot_too_small"] += 1
@@ -925,7 +991,7 @@ def run_backtest(args: argparse.Namespace) -> None:
                     fee = calc_fee(value, args.buy_cost_bps, args.min_cost)
                     total_cost = value + fee
 
-                    # 若加上手续费后超出现金，则再保守回退一次 shares
+                    # 不够钱则收缩 shares
                     if total_cost > cash_available + 1e-9:
                         shares2 = int((cash_available / (px * (1 + args.buy_cost_bps / 10000.0))) / args.lot_size) * args.lot_size
                         if shares2 <= 0:
@@ -941,7 +1007,7 @@ def run_backtest(args: argparse.Namespace) -> None:
                             buy_skip_totals["insufficient_cash"] += 1
                             continue
 
-                    # 执行买入：扣现金 + 记录费用 + 建持仓
+                    # 成交
                     cash_available -= total_cost
                     traded_value_buy += value
                     fee_today += fee
@@ -955,7 +1021,7 @@ def run_backtest(args: argparse.Namespace) -> None:
                         buy_price=px,
                         must_sell=False,
                         blocked_sell_days=0,
-                        last_mark_price=px
+                        last_mark_price=px,
                     )
 
                     trade_rows.append({
@@ -968,13 +1034,11 @@ def run_backtest(args: argparse.Namespace) -> None:
                         "shares": shares,
                         "reason": "enter_topk",
                         "sell_delay_days": "",
-                        "fee": fee
+                        "fee": fee,
                     })
                     slots -= 1
 
-        # ============================================================
-        # C) 数据结束日：强制清仓（避免期末留仓不可比）
-        # ============================================================
+        # ---------------- data_end 终止强平 ----------------
         if d == data_end:
             for sym in list(positions.keys()):
                 pos = positions[sym]
@@ -1000,13 +1064,11 @@ def run_backtest(args: argparse.Namespace) -> None:
                     "shares": pos.shares,
                     "reason": "terminal_liquidation",
                     "sell_delay_days": pos.blocked_sell_days,
-                    "fee": fee
+                    "fee": fee,
                 })
                 del positions[sym]
 
-        # ============================================================
-        # D) NAV / Diagnostics 输出（每日估值、交易统计、阻塞原因）
-        # ============================================================
+        # ---------------- NAV & Diagnostics ----------------
         pos_value = 0.0
         for sym, pos in positions.items():
             mp = pos.last_mark_price if pos.last_mark_price > 0 else pos.buy_price
@@ -1023,7 +1085,7 @@ def run_backtest(args: argparse.Namespace) -> None:
             "positions_value": pos_value,
             "holdings": len(positions),
             "fee_today": fee_today,
-            "cum_fee": cum_fee
+            "cum_fee": cum_fee,
         })
 
         overdue = [p for p in positions.values() if p.must_sell]
@@ -1050,16 +1112,13 @@ def run_backtest(args: argparse.Namespace) -> None:
             **{f"sell_block_{k}": v for k, v in sell_block.items()},
         })
 
-        # ============================================================
-        # E) 日终生成 score（避免未来信息：今天收盘后算，明天才执行）
-        # ============================================================
+        # ---------------- EOD 生成下一天执行的 score ----------------
         if d <= end:
             df_feat = feat_loader.load_day(d)
             if df_feat.empty:
                 scores_today = pd.Series(dtype=float)
             else:
                 X = df_feat[used_features].copy()
-                # LambdaRank 输出是“排序分数”，绝对值无意义，用于同日截面排序即可
                 yhat = booster.predict(X, num_iteration=booster.best_iteration or -1)
                 scores_today = pd.Series(yhat, index=df_feat["order_book_id"].values, dtype=float)
             scores_pending = scores_today
@@ -1068,9 +1127,7 @@ def run_backtest(args: argparse.Namespace) -> None:
             scores_pending = None
             pending_signal_day = None
 
-        # ============================================================
-        # F) 日终更新 last_close（供明天 prev_close_map 使用）
-        # ============================================================
+        # ---------------- EOD 更新 last_close 给下一天当 prev_close ----------------
         if not day_ohlcv.empty:
             tmp = day_ohlcv.reset_index()
             for _, r in tmp.iterrows():
@@ -1079,18 +1136,68 @@ def run_backtest(args: argparse.Namespace) -> None:
                 if np.isfinite(c) and c > 0:
                     last_close[sym] = float(c)
 
-    # ============================================================
-    # 8) 回测结束：汇总输出文件
-    # ============================================================
+    # ===================== 回测结束：汇总输出 =====================
     nav_df = pd.DataFrame(nav_rows)
     diag_df = pd.DataFrame(diag_rows)
     trades_df = pd.DataFrame(trade_rows)
+    ic_df = pd.DataFrame(ic_rows)
 
-    # “零成本（去手续费）”参考曲线：把已支付手续费加回去
+    # 方便对比：把手续费加回去，得到“零成本”的 NAV
     nav_df["nav_zero_cost_fixed_trades"] = nav_df["nav_total"] + nav_df["cum_fee"]
 
     nav_df["date_ts"] = pd.to_datetime(nav_df["date"])
     nav_df = nav_df.sort_values("date_ts").reset_index(drop=True)
+
+    # 策略日收益
+    nav_df["ret"] = nav_df["nav_total"].pct_change().fillna(0.0)
+
+    # ---------------- Benchmark 对齐 ----------------
+    bm_metrics = None
+    if args.enable_benchmark:
+        if not args.benchmark_csv:
+            raise ValueError("--enable_benchmark requires --benchmark_csv")
+        bm_raw = load_benchmark_csv(args.benchmark_csv)
+
+        bm_raw["bm_ret"] = bm_raw["close"].pct_change()
+        bm_raw["bm_nav"] = (1.0 + bm_raw["bm_ret"].fillna(0.0)).cumprod()
+
+        # 对齐到 nav_df 的日期
+        bm_aligned = bm_raw.set_index("date").reindex(nav_df["date_ts"]).copy()
+        # benchmark 缺失：这里不强行 forward-fill，缺了就 NaN（更真实）
+        nav_df["bm_close"] = bm_aligned["close"].values
+        nav_df["bm_ret"] = bm_aligned["bm_ret"].values
+        nav_df["bm_nav"] = bm_aligned["bm_nav"].values
+
+        # 归一化：与策略起始日对齐
+        base = nav_df["bm_nav"].dropna()
+        if not base.empty:
+            base0 = float(base.iloc[0])
+            nav_df["bm_nav_norm"] = nav_df["bm_nav"] / base0
+        else:
+            nav_df["bm_nav_norm"] = np.nan
+
+        # 策略 NAV 归一化（便于画图）
+        nav_df["nav_norm"] = nav_df["nav_total"] / float(nav_df["nav_total"].iloc[0])
+
+        # 基准指标（与策略同日期交集）
+        strat_r = nav_df.set_index("date_ts")["ret"]
+        bm_r = nav_df.set_index("date_ts")["bm_ret"]
+        bm_metrics = compute_basic_metrics(strat_r, bm_r)
+
+    # ---------------- IC / RankIC 汇总 ----------------
+    ic_summary = {}
+    if not ic_df.empty:
+        ic_valid = ic_df.dropna(subset=["ic", "rank_ic"])
+        ic_summary = {
+            "ic_mean": float(ic_valid["ic"].mean()) if not ic_valid.empty else np.nan,
+            "ic_std": float(ic_valid["ic"].std(ddof=1)) if len(ic_valid) > 1 else np.nan,
+            "rank_ic_mean": float(ic_valid["rank_ic"].mean()) if not ic_valid.empty else np.nan,
+            "rank_ic_std": float(ic_valid["rank_ic"].std(ddof=1)) if len(ic_valid) > 1 else np.nan,
+            "ic_obs_days": int(len(ic_valid)),
+        }
+
+    # ---------------- 策略自身指标 ----------------
+    strat_metrics = compute_basic_metrics(nav_df.set_index("date_ts")["ret"], None)
 
     def nav_at(date_str: str) -> Optional[float]:
         m = nav_df[nav_df["date"] == date_str]
@@ -1104,14 +1211,14 @@ def run_backtest(args: argparse.Namespace) -> None:
             "end": fmt_date(end),
             "data_end": fmt_date(data_end),
             "preheat": fmt_date(preheat),
-            "tail_start": fmt_date(tail_start)
+            "tail_start": fmt_date(tail_start),
         },
         "strategy": {
             "name": "TopkDropout (qlib-style)",
             "topk": args.topk,
             "n_drop": args.n_drop,
             "shift": 1,
-            "deal_price": "close"
+            "deal_price": "close",
         },
         "rules": {
             "settlement_t1": bool(args.settlement_t1),
@@ -1121,11 +1228,12 @@ def run_backtest(args: argparse.Namespace) -> None:
             "limit_eps": args.limit_eps,
             "limit_tiny": args.limit_tiny,
             "lot_size": args.lot_size,
+            "limit_inference": "mainboard(10%+5% ST), 300/688(20%), BJ(30%)",
             "costs_bps": {
                 "buy_cost_bps": args.buy_cost_bps,
                 "sell_cost_bps": args.sell_cost_bps,
                 "sell_stamp_bps": args.sell_stamp_bps,
-                "min_cost": args.min_cost
+                "min_cost": args.min_cost,
             },
         },
         "result": {
@@ -1142,67 +1250,100 @@ def run_backtest(args: argparse.Namespace) -> None:
         },
         "buy_skip_reason": buy_skip_totals,
         "sell_block_reason": sell_block_totals,
+        "metrics_strategy": strat_metrics,
+        "metrics_vs_benchmark": bm_metrics if bm_metrics is not None else None,
+        "ic_rankic": ic_summary if ic_summary else None,
     }
 
+    # ---------------- 落盘 ----------------
     ensure_dir(out_dir)
+
+    # main csv
     nav_df.drop(columns=["date_ts"]).to_csv(out_dir / "daily_nav.csv", index=False, encoding="utf-8")
     diag_df.to_csv(out_dir / "diagnostics_daily.csv", index=False, encoding="utf-8")
     trades_df.to_csv(out_dir / "trades.csv", index=False, encoding="utf-8")
+
+    # ic daily
+    if not ic_df.empty:
+        ic_df.to_csv(out_dir / "ic_daily.csv", index=False, encoding="utf-8")
+
+    # summary json
     with open(out_dir / "diagnostics_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    # net vs zero cost
     nav_df[["date", "nav_total", "nav_zero_cost_fixed_trades", "fee_today", "cum_fee"]].to_csv(
         out_dir / "nav_net_vs_zero_cost.csv", index=False, encoding="utf-8"
     )
+
+    # plot: strategy vs benchmark
+    if args.enable_benchmark:
+        try:
+            import matplotlib.pyplot as plt
+
+            plot_df = nav_df.dropna(subset=["nav_norm"]).copy()
+            plt.figure()
+            plt.plot(plot_df["date"], plot_df["nav_norm"], label="Strategy (NAV normalized)")
+            if "bm_nav_norm" in plot_df.columns:
+                plt.plot(plot_df["date"], plot_df["bm_nav_norm"], label="Benchmark 000985 (normalized)")
+            plt.xticks(rotation=45)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(out_dir / "nav_compare.png", dpi=150)
+            plt.close()
+        except Exception as e:
+            print(f"[WARN] Failed to plot nav_compare.png: {e}")
 
     print("[OK] Backtest finished.")
     print(f"Output dir: {out_dir}")
 
 
-# ============================================================
-# 9) 参数解析
-# ============================================================
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser()
+
+    # IO
     p.add_argument("--model_dir", required=True)
     p.add_argument("--features_dir", required=True)
     p.add_argument("--ohlcv_dir", required=True)
     p.add_argument("--calendar_csv", required=True)
     p.add_argument("--out_dir", required=True)
 
-    # 回测窗口：main 2025-01-01 ~ 2025-12-10；tail 只卖不买从 12-11 到数据终止 12-15
+    # window
     p.add_argument("--start_date", default="2025-01-01")
     p.add_argument("--end_date", default="2025-12-10")
     p.add_argument("--data_end_date", default="2025-12-15")
     p.add_argument("--tail_start_date", default="2025-12-11")
 
-    # TopkDropout 参数
+    # strategy params
     p.add_argument("--topk", type=int, default=50)
     p.add_argument("--n_drop", type=int, default=5)
-
-    # 资金与结算
     p.add_argument("--init_cash", type=float, default=1_000_000.0)
     p.add_argument("--settlement_t1", action="store_true",
-                   help="If set, sell proceeds become available next trading day.")
+                   help="If set, sell proceeds become available next trading day (T+1).")
 
-    # IPO 过滤与长期卖不掉强平
+    # constraints
     p.add_argument("--ipo_min_days", type=int, default=60)
     p.add_argument("--max_blocked_days", type=int, default=60)
-    p.add_argument("--haircut", type=float, default=0.05)
+    p.add_argument("--haircut", type=float, default=0.05)          # 强平/终止强平额外冲击成本（保守）
 
-    # 涨跌停锁死判定阈值
-    # limit_eps：close 接近涨跌停价的相对误差容忍
-    # limit_tiny：振幅阈值，越小越接近“一字板”
-    p.add_argument("--limit_eps", type=float, default=0.0015)
-    p.add_argument("--limit_tiny", type=float, default=0.001)
+    # limit lock detector
+    p.add_argument("--limit_eps", type=float, default=0.0015)       # 接近涨跌停价的相对误差阈值
+    p.add_argument("--limit_tiny", type=float, default=0.001)       # 日内振幅阈值（越小越保守）
 
-    # A 股交易：100 股一手
+    # trade lot
     p.add_argument("--lot_size", type=int, default=100)
 
-    # 费用参数（bps）：买卖佣金 + 卖出印花税（仅卖出）
-    p.add_argument("--buy_cost_bps", type=float, default=15.0)
+    # costs
+    p.add_argument("--buy_cost_bps", type=float, default=15.0)      # 双边佣金示例：15bp
     p.add_argument("--sell_cost_bps", type=float, default=15.0)
-    p.add_argument("--sell_stamp_bps", type=float, default=10.0)
+    p.add_argument("--sell_stamp_bps", type=float, default=10.0)    # 印花税示例：10bp（按你的设定）
     p.add_argument("--min_cost", type=float, default=0.0)
+
+    # benchmark & ic
+    p.add_argument("--enable_benchmark", action="store_true")
+    p.add_argument("--benchmark_csv", default="", help="Local benchmark csv (000985).")
+    p.add_argument("--compute_ic", action="store_true", help="Compute daily IC & RankIC and output ic_daily.csv")
+
     return p
 
 
@@ -1213,4 +1354,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

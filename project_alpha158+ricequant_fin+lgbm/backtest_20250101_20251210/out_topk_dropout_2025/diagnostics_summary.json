@@ -21,6 +21,7 @@
     "limit_eps": 0.0015,
     "limit_tiny": 0.001,
     "lot_size": 100,
+    "limit_inference": "mainboard(10%+5% ST), 300/688(20%), BJ(30%)",
     "costs_bps": {
       "buy_cost_bps": 15.0,
       "sell_cost_bps": 15.0,
@@ -52,5 +53,39 @@
     "missing_row": 195,
     "invalid_row": 0,
     "limit_locked": 14
+  },
+  "metrics_strategy": {
+    "n_obs": 232,
+    "annual_return": 0.2820787805915933,
+    "annual_volatility": 0.15879093099692387,
+    "sharpe_ratio": 1.776416189644091,
+    "cumulative_return": 0.28116175921999687,
+    "max_drawdown": -0.1078499376628902,
+    "hit_rate": 0.5732758620689655,
+    "mean_daily_return": 0.0011193602404428306,
+    "std_daily_return": 0.010002888425482815
+  },
+  "metrics_vs_benchmark": {
+    "n_obs": 232,
+    "annual_return": 0.2820787805915933,
+    "annual_volatility": 0.15879093099692387,
+    "sharpe_ratio": 1.776416189644091,
+    "cumulative_return": 0.28116175921999687,
+    "max_drawdown": -0.1078499376628902,
+    "hit_rate": 0.5732758620689655,
+    "mean_daily_return": 0.0011193602404428306,
+    "std_daily_return": 0.010002888425482815,
+    "annual_excess_return": 0.030790224563412676,
+    "tracking_error": 0.12082006864982177,
+    "information_ratio": 0.2548436274494543,
+    "beta": 0.6669705708959835,
+    "alpha": 0.11583972803156857
+  },
+  "ic_rankic": {
+    "ic_mean": 0.01765184880994422,
+    "ic_std": 0.11141080455002353,
+    "rank_ic_mean": 0.06812747973257265,
+    "rank_ic_std": 0.14187339408822602,
+    "ic_obs_days": 229
   }
 }
