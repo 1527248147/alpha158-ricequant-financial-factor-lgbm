@@ -141,7 +141,7 @@ y_t = \frac{Close(t+2)}{Close(t+1)} - 1
 ---
 
 ## 5. 回测曲线
-![2025 NAV: Strategy vs CSI 300](project_alpha158+ricequant_fin+lgbm/strategy_vs_csi300_2025.png)
+![2025 NAV: Strategy vs CSI 300](project_alpha158+ricequant_fin+lgbm/backtest_20250101_20251210/out_topk_dropout_2025/nav_compare.png)
 
 ---
 
