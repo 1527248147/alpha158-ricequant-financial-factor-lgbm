@@ -172,7 +172,7 @@ project_alpha158+ricequant_fin+lgbm/
 
 ### Step 1 — 打标签（Labeling）
 ```bat
-cd /d C:\AI_STOCK\project_alpha158+ricequant_fin+lgbm
+cd /d project_alpha158+ricequant_fin+lgbm
 
 python labeled\build_labels_strict_by_calendar_from_ohlcv.py ^
   --feature_dir "labeled" ^
@@ -192,7 +192,7 @@ labeled\_calendar\labeled_yearly_parquet
 
 ### Step 2 — 训练 LightGBM（Training）
 ```bat
-cd /d C:\AI_STOCK\project_alpha158+ricequant_fin+lgbm
+cd /d project_alpha158+ricequant_fin+lgbm
 
 python train_models\train_lgbm_lambdarank_strict_calendar_v4_fundselect_validperm.py ^
   --data_dir "labeled\_calendar\labeled_yearly_parquet" ^
@@ -225,7 +225,7 @@ train_models\_train_lambdarank_v4_alpha_plus_fundTop15_seed42
 
 ### Step 3 — 回测（Backtest）
 ```bat
-cd /d C:\AI_STOCK\project_alpha158+ricequant_fin+lgbm
+cd /d project_alpha158+ricequant_fin+lgbm
 python backtest_20250101_20251210\backtest_topk_dropout.py ^
   --model_dir "train_models\_train_lambdarank_v4_alpha_plus_fundTop15_seed42" ^
   --features_dir "labeled\_calendar\labeled_yearly_parquet" ^
